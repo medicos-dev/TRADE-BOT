@@ -17,7 +17,7 @@ if sys.prefix == sys.base_prefix:
     if not os.path.exists(venv_dir):
         subprocess.check_call([sys.executable, "-m", "venv", "venv"])
     python_exe = os.path.join(venv_dir, "Scripts", "python.exe") if os.name == 'nt' else os.path.join(venv_dir, "bin", "python")
-    subprocess.check_call([python_exe, "-m", "pip", "install", "pandas", "scikit-learn", "python-dotenv", "aiohttp", "aiosqlite", "lightgbm", "numba", "psutil"], stdout=subprocess.DEVNULL)
+    subprocess.check_call([python_exe, "-m", "pip", "install", "pandas", "scikit-learn", "python-dotenv", "aiohttp", "aiosqlite", "lightgbm", "xgboost", "optuna", "numba", "psutil"], stdout=subprocess.DEVNULL)
     sys.exit(subprocess.call([python_exe] + sys.argv))
 
 import json
@@ -38,7 +38,7 @@ import aiosqlite
 from lightgbm import LGBMClassifier
 
 import xgboost as xgb
-from hmmlearn import hmm
+from sklearn.mixture import GaussianMixture
 import optuna
 
 from sklearn.metrics import accuracy_score
@@ -337,7 +337,7 @@ def train_hmm_model(df):
         import numpy as np
         X = df[['returns', 'volatility']].replace([np.inf, -np.inf], np.nan).dropna().values
         if len(X) > 100:
-            model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=100, random_state=42)
+            model = GaussianMixture(n_components=3, covariance_type="full", max_iter=100, random_state=42)
             model.fit(X)
             means_vol = model.means_[:, 1]
             sorted_indices = np.argsort(means_vol)
