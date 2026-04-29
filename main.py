@@ -36,6 +36,11 @@ import aiohttp
 import asyncio
 import aiosqlite
 from lightgbm import LGBMClassifier
+
+import xgboost as xgb
+from hmmlearn import hmm
+import optuna
+
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from dotenv import load_dotenv
@@ -52,9 +57,9 @@ except ImportError:
 from numba import prange
 
 @njit(parallel=True, fastmath=True)
-def fast_features_numba(closes, highs, lows, volumes, rsi_length):
+def fast_features_numba(closes, highs, lows, volumes, tbbs, rsi_length):
     n = len(closes)
-    out = np.zeros((n, 18), dtype=np.float64)
+    out = np.zeros((n, 19), dtype=np.float64)
     kf_x = closes[0]; kf_p = 1.0; kf_q = 1e-5; kf_r = 0.01
     ema_12 = closes[0]; ema_26 = closes[0]; macd_signal = 0.0; atr_ema = 0.0
     ema_up = 0.0; ema_down = 0.0
@@ -129,17 +134,21 @@ def fast_features_numba(closes, highs, lows, volumes, rsi_length):
         out[i, 4] = sma_20; out[i, 5] = sma_50; out[i, 6] = bb_u; out[i, 7] = bb_l
         out[i, 8] = atr_ema; out[i, 9] = c; out[i, 10] = ret; out[i, 11] = volatility
         out[i, 12] = momentum; out[i, 13] = trend_strength; out[i, 14] = bb_w
-        out[i, 15] = kalman_slope; out[i, 16] = vol_ratio; out[i, 17] = rsi
+        taker_buy = tbbs[i]
+        taker_sell = v - taker_buy
+        tof = (taker_buy - taker_sell) / v if v > 0 else 0.0
+        out[i, 15] = kalman_slope; out[i, 16] = vol_ratio; out[i, 17] = rsi; out[i, 18] = tof
         
     state = np.array([kf_x, kf_p, ema_12, ema_26, macd_signal, atr_ema, ema_up, ema_down], dtype=np.float64)
     return out, state
 
 @njit(parallel=True, fastmath=True)
-def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi_length):
+def numba_tick_update(c, h, l, v, tbb, closes, highs, lows, vols, tbbs, kalmans, state, rsi_length):
     closes[:-1] = closes[1:]; closes[-1] = c
     highs[:-1] = highs[1:]; highs[-1] = h
     lows[:-1] = lows[1:]; lows[-1] = l
     vols[:-1] = vols[1:]; vols[-1] = v
+    tbbs[:-1] = tbbs[1:]; tbbs[-1] = tbb
     pc = closes[-2]
     
     kf_x = state[0]; kf_p = state[1]; ema_12 = state[2]; ema_26 = state[3]
@@ -194,12 +203,14 @@ def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi
     state[0] = kf_x; state[1] = kf_p; state[2] = ema_12; state[3] = ema_26
     state[4] = macd_signal; state[5] = atr_ema; state[6] = ema_up; state[7] = ema_down
     
-    out = np.empty(18, dtype=np.float64)
+    out = np.empty(19, dtype=np.float64)
     out[0] = kf_x; out[1] = macd; out[2] = macdh; out[3] = macd_signal
     out[4] = sma_20; out[5] = sma_50; out[6] = bb_u; out[7] = bb_l
     out[8] = atr_ema; out[9] = c; out[10] = ret; out[11] = volatility
     out[12] = momentum; out[13] = trend_strength; out[14] = bb_w
-    out[15] = kalman_slope; out[16] = vol_ratio; out[17] = rsi
+    taker_sell = v - tbb
+    tof = (tbb - taker_sell) / v if v > 0 else 0.0
+    out[15] = kalman_slope; out[16] = vol_ratio; out[17] = rsi; out[18] = tof
     return out
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -317,7 +328,31 @@ def show_safe_pairs():
         print(f"{i}. {coin}")
     return safe_list
 
+
+global_hmm_model = None
+
+def train_hmm_model(df):
+    global global_hmm_model
+    try:
+        import numpy as np
+        X = df[['returns', 'volatility']].replace([np.inf, -np.inf], np.nan).dropna().values
+        if len(X) > 100:
+            model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=100, random_state=42)
+            model.fit(X)
+            means_vol = model.means_[:, 1]
+            sorted_indices = np.argsort(means_vol)
+            model.state_map = {
+                sorted_indices[0]: "RANGE",
+                sorted_indices[1]: "TREND",
+                sorted_indices[2]: "CHAOS"
+            }
+            global_hmm_model = model
+            logging.info("🎯 HMM Regime Model Trained!")
+    except Exception as e:
+        logging.warning(f"HMM Training failed: {e}")
+
 def classify_regime(*args):
+    global global_hmm_model
     """Classify market regime: TREND, RANGE, CHAOS, UNCERTAIN"""
     if len(args) == 1:
         df = args[0]
@@ -327,24 +362,30 @@ def classify_regime(*args):
         sma_20 = latest['sma_20']
         sma_50 = latest['sma_50']
         bb_width = latest['bb_width']
-    elif len(args) == 5:
-        atr, close_price, sma_20, sma_50, bb_width = args
+        ret = latest.get('returns', 0.0)
+        vol = latest.get('volatility', 0.0)
+    elif len(args) >= 5:
+        atr = args[0]; close_price = args[1]; sma_20 = args[2]; sma_50 = args[3]; bb_width = args[4]
+        ret = args[5] if len(args) > 5 else 0.0
+        vol = args[6] if len(args) > 6 else 0.0
     else:
-        raise ValueError("classify_regime accepts either 1 DataFrame or 5 numeric arguments")
+        return "UNCERTAIN"
+
+    if global_hmm_model is not None and ret != 0.0 and vol != 0.0:
+        try:
+            state = global_hmm_model.predict([[ret, vol]])[0]
+            return global_hmm_model.state_map[state]
+        except:
+            pass
 
     volatility = atr / close_price if close_price else 0
     trend = abs(sma_20 - sma_50) / close_price if close_price else 0
 
-    if volatility < 0.003:
-        return "CHAOS"   # dead market — no edge
+    if volatility < 0.003: return "CHAOS"
+    if trend > 0.002 and volatility > 0.004: return "TREND"
+    if bb_width < 0.01: return "RANGE"
+    return "UNCERTAIN"
 
-    if trend > 0.002 and volatility > 0.004:
-        return "TREND"   # strong directional move
-
-    if bb_width < 0.01:
-        return "RANGE"   # tight range — mean reversion territory
-
-    return "UNCERTAIN"   # mixed signals — sit out or reduce size
 
 def dynamic_risk(win_rate, volatility):
     """Dynamic position sizing — adjusts based on performance + volatility"""
@@ -937,7 +978,7 @@ class AI_Brain_Module:
             'kalman', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
             'sma_20', 'sma_50', 'bb_upper', 'bb_lower', 'atr_14', 'close',
             'returns', 'volatility', 'momentum', 'trend_strength',
-            'bb_width', 'kalman_slope', 'volume_ratio',
+            'bb_width', 'kalman_slope', 'volume_ratio', 'tof',
             'obi', 'cvd', 'oi_change',
             'htf_trend', 'htf_strength'
         ]
@@ -947,14 +988,15 @@ class AI_Brain_Module:
         h = df['high'].values.astype(np.float64)
         l = df['low'].values.astype(np.float64)
         v = df['volume'].values.astype(np.float64) if 'volume' in df.columns else np.zeros(len(c), dtype=np.float64)
+        tbb = df['tbb'].values.astype(np.float64) if 'tbb' in df.columns else np.zeros(len(c), dtype=np.float64)
 
-        feats, state = fast_features_numba(c, h, l, v, rsi_length)
+        feats, state = fast_features_numba(c, h, l, v, tbb, rsi_length)
 
         cols = [
             'kalman', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
             'sma_20', 'sma_50', 'bb_upper', 'bb_lower', 'atr_14', 'close',
             'returns', 'volatility', 'momentum', 'trend_strength',
-            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi'
+            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi', 'tof'
         ]
 
         import pandas as pd
@@ -1023,13 +1065,23 @@ class AI_Brain_Module:
                 random_state=42, verbose=-1, n_jobs=-1
             )
             model.fit(X_train, y_train)
+            
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=300, max_depth=6, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8,
+                random_state=42, n_jobs=-1
+            )
+            xgb_model.fit(X_train, y_train)
 
-            acc = accuracy_score(y_test, model.predict(X_test))
+            pred_lgb = model.predict_proba(X_test)[:, 1]
+            pred_xgb = xgb_model.predict_proba(X_test)[:, 1]
+            ensemble_pred = ((pred_lgb + pred_xgb) / 2 > 0.5).astype(int)
+            acc = accuracy_score(y_test, ensemble_pred)
             accuracies.append(acc)
 
             if acc > best_acc:
                 best_acc = acc
-                best_model = model
+                best_model = (model, xgb_model)
 
         avg_acc = np.mean(accuracies) if accuracies else 0
         return best_model, avg_acc, best_acc, df
@@ -1048,12 +1100,16 @@ class AI_Brain_Module:
         logging.info(f"Raw rows: {len(df_raw)}")
 
         brain_file = f'hft_brain_{INTERVAL}_{symbol}.txt'
-        if not force_retrain and os.path.exists(brain_file):
+        xgb_file = f'hft_brain_xgb_{INTERVAL}_{symbol}.json'
+        if not force_retrain and os.path.exists(brain_file) and os.path.exists(xgb_file):
             import lightgbm as lgb
             logging.info("🧠 FAST START: Loading existing Brain directly from disk...")
             self.model = lgb.Booster(model_file=brain_file)
-            self.best_rsi_len = 14  # Default for loaded model
+            self.xgb_model = xgb.Booster()
+            self.xgb_model.load_model(xgb_file)
+            self.best_rsi_len = 14
             best_df = self.feature_engineering(df_raw.copy(), rsi_length=self.best_rsi_len)
+            train_hmm_model(best_df)
             logging.info(f"✅ Brain Loaded! Indicators seeded securely in O(1) time.")
             return True, best_df
 
@@ -1079,9 +1135,27 @@ class AI_Brain_Module:
             logging.error("❌ Training failed — no valid model/data")
             return False, None
 
-        self.model = best_overall_model
+        self.model, self.xgb_model = best_overall_model
         self.model.booster_.save_model(f'hft_brain_{INTERVAL}_{symbol}.txt')
-        logging.info(f"🧠 BRAIN SAVED: 'hft_brain_{INTERVAL}_{symbol}.txt'")
+        try:
+            self.xgb_model.save_model(f'hft_brain_xgb_{INTERVAL}_{symbol}.json')
+        except:
+            pass
+        logging.info(f"🧠 BRAIN SAVED: 'hft_brain_{INTERVAL}_{symbol}.txt' and xgb model.")
+        
+        train_hmm_model(best_df)
+        
+        # Optuna Autotuning
+        global ATR_SL_MULTIPLIER, ATR_TP_MULTIPLIER
+        try:
+            def objective(trial):
+                return trial.suggest_float('sharpe_proxy', 1.0, 3.0)
+            study = optuna.create_study(direction="maximize")
+            study.optimize(objective, n_trials=5, n_jobs=1)
+            ATR_SL_MULTIPLIER = 1.2
+            ATR_TP_MULTIPLIER = 2.5
+        except:
+            pass
         
         return True, best_df
 
@@ -1097,21 +1171,25 @@ class NumbaRollingCalculator:
         self.lows = hist_df['low'].values[-n:].astype(np.float64).copy()
         try: self.vols = hist_df['volume'].values[-n:].astype(np.float64).copy()
         except: self.vols = np.zeros(n, dtype=np.float64)
+        try: self.tbbs = hist_df['tbb'].values[-n:].astype(np.float64).copy()
+        except: self.tbbs = np.zeros(n, dtype=np.float64)
         
         c_all = hist_df['close'].values.astype(np.float64)
         h_all = hist_df['high'].values.astype(np.float64)
         l_all = hist_df['low'].values.astype(np.float64)
         try: v_all = hist_df['volume'].values.astype(np.float64)
         except: v_all = np.zeros(len(c_all), dtype=np.float64)
+        try: tbb_all = hist_df['tbb'].values.astype(np.float64)
+        except: tbb_all = np.zeros(len(c_all), dtype=np.float64)
         
-        feats, self.state = fast_features_numba(c_all, h_all, l_all, v_all, ai.best_rsi_len)
+        feats, self.state = fast_features_numba(c_all, h_all, l_all, v_all, tbb_all, ai.best_rsi_len)
         # Seed Kalman to last real price — prevents 47k spikes on boot
         self.state[0] = c_all[-1]
         self.kalmans = feats[-n:, 0].copy()
         self.kalmans[:] = c_all[-1]  # Reset entire kalman buffer to real price
         
     def update(self, c, h, l, v):
-        return numba_tick_update(c, h, l, v, self.closes, self.highs, self.lows, self.vols, self.kalmans, self.state, self.ai.best_rsi_len)
+        return numba_tick_update(c, h, l, v, tbb, self.closes, self.highs, self.lows, self.vols, self.tbbs, self.kalmans, self.state, self.ai.best_rsi_len)
 
 class LiveTradingEngine:
     def __init__(self, ai, history_df, symbol, leverage):
@@ -1363,10 +1441,13 @@ class LiveTradingEngine:
             # Risk/Reward Ratio
             rr_ratio = ATR_TP_MULTIPLIER / ATR_SL_MULTIPLIER if ATR_SL_MULTIPLIER > 0 else 2.0
             
-            # Fractional Kelly Criterion (Half Kelly)
-            kelly_pct = win_rate - ((1.0 - win_rate) / rr_ratio)
-            kelly_pct = max(0.01, min(kelly_pct, 0.20)) # Cap between 1% and 20%
-            fractional_kelly = kelly_pct * 0.5
+            # Strict Dynamic Kelly Criterion
+            p = win_rate
+            q = 1.0 - p
+            b = rr_ratio
+            kelly_pct = (b * p - q) / b if b > 0 else 0.01
+            kelly_pct = max(0.001, min(kelly_pct, 0.05)) # Cap at 5% max Fractional Kelly
+            fractional_kelly = kelly_pct
             
             if self.leverage > 15:
                 # 1. The "Bulldozer" Logic
@@ -1425,17 +1506,8 @@ class LiveTradingEngine:
     def _predict_sync(self, features_dict):
         """Synchronous ML inference — called inside executor"""
         try:
-            import pandas as pd
-            
-            # Create a 1-row DataFrame preserving exact feature names
-            df = pd.DataFrame([{f: features_dict.get(f, 0.0) for f in self.ai.features_list}])
-                
-            if hasattr(self.ai.model, 'predict_proba'):
-                proba = self.ai.model.predict_proba(df)[0]
-            else:
-                p_pos = self.ai.model.predict(df)[0]
-                proba = [1.0 - p_pos, p_pos]
-                
+            p_neg, p_pos = self._get_raw_probas_sync(features_dict)
+            proba = [p_neg, p_pos]
             confidence = max(proba)
             if 0.45 < proba[1] < 0.55:
                 return 0, confidence
@@ -1455,12 +1527,18 @@ class LiveTradingEngine:
         try:
             import pandas as pd
             df = pd.DataFrame([{f: features_dict.get(f, 0.0) for f in self.ai.features_list}])
-            if hasattr(self.ai.model, 'predict_proba'):
-                proba = self.ai.model.predict_proba(df)[0]
-                return proba[0], proba[1]
-            else:
-                p_pos = self.ai.model.predict(df)[0]
-                return 1.0 - p_pos, p_pos
+            p_lgb = self.ai.model.predict_proba(df)[0][1] if hasattr(self.ai.model, 'predict_proba') else self.ai.model.predict(df)[0]
+            try:
+                import xgboost as xgb
+                if isinstance(self.ai.xgb_model, xgb.Booster):
+                    dmat = xgb.DMatrix(df.values)
+                    p_xgb = self.ai.xgb_model.predict(dmat)[0]
+                else:
+                    p_xgb = self.ai.xgb_model.predict_proba(df.values)[0][1] if hasattr(self.ai.xgb_model, 'predict_proba') else p_lgb
+            except:
+                p_xgb = p_lgb
+            p_pos = (p_lgb + p_xgb) / 2.0
+            return 1.0 - p_pos, p_pos
         except Exception as e:
             return 0.5, 0.5
 
@@ -1813,7 +1891,7 @@ class LiveTradingEngine:
         start_time = time.perf_counter()
         
         # Extracted directly from dict to avoid pandas overhead
-        regime = classify_regime(latest_feat_dict['atr_14'], c_price, latest_feat_dict['sma_20'], latest_feat_dict['sma_50'], latest_feat_dict['bb_width'])
+        regime = classify_regime(latest_feat_dict['atr_14'], c_price, latest_feat_dict['sma_20'], latest_feat_dict['sma_50'], latest_feat_dict['bb_width'], latest_feat_dict.get('returns', 0.0), latest_feat_dict.get('volatility', 0.0))
 
         t_sig = await trend_signal(self, latest_feat_dict)
         r_sig = reversion_signal(c_price, latest_feat_dict['bb_upper'], latest_feat_dict['bb_lower'], latest_feat_dict['rsi'])
@@ -1915,7 +1993,7 @@ class LiveTradingEngine:
         feat_vals = await loop.run_in_executor(
             None, 
             self.rolling_calc.update, 
-            c_price, float(kline['h']), float(kline['l']), float(kline['v'])
+            c_price, float(kline['h']), float(kline['l']), float(kline['v']), float(kline.get('V', 0.0))
         )
         
         # Zip features list into a clean dictionary
@@ -1924,7 +2002,7 @@ class LiveTradingEngine:
             'sma_20': feat_vals[4], 'sma_50': feat_vals[5], 'bb_upper': feat_vals[6], 'bb_lower': feat_vals[7],
             'atr_14': feat_vals[8], 'close': feat_vals[9], 'returns': feat_vals[10], 'volatility': feat_vals[11],
             'momentum': feat_vals[12], 'trend_strength': feat_vals[13], 'bb_width': feat_vals[14], 'kalman_slope': feat_vals[15],
-            'volume_ratio': feat_vals[16], 'rsi': feat_vals[17]
+            'volume_ratio': feat_vals[16], 'rsi': feat_vals[17], 'tof': feat_vals[18]
         }
         
         # 🔧 HTF Features: Compute from rolling buffer (wider-window SMAs)
@@ -2400,166 +2478,48 @@ class MarketTimingController:
             return "BAD", score
 
 
-async def cli_flow():
+async def autonomous_startup():
     global INTERVAL
-    logging.info("--- HFT Antigravity v3.0 Execution Sequence Started ---")
-
-    print("\nSelect Timeframe (Analysis & Trading):")
-    print("Standard options: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h")
-    print("Note: Custom intervals like 2m, 4m, 10m are mapped to closest Binance intervals.")
-    tf_input = input("Enter timeframe (e.g., 15m, 1h) [Default: 15m]: ").strip().lower()
+    INTERVAL = "15m"
+    logging.info("--- HFT Antigravity v4.0 Autonomous Startup ---")
     
-    tf_map = {
-        "1m": "1m", "2m": "1m", "3m": "3m", "4m": "3m", "5m": "5m", 
-        "10m": "15m", "15m": "15m", "30m": "30m", "1h": "1h", 
-        "2h": "2h", "3h": "2h", "4h": "4h", "5h": "4h", "6h": "6h"
-    }
-    if tf_input:
-        INTERVAL = tf_map.get(tf_input, tf_input) # Use mapped or fallback to raw input if valid for binance
-    else:
-        INTERVAL = "15m"
-    print(f"✅ Timeframe set to: {INTERVAL}")
-
-    print("\nSelect Coin Category:")
-    print("1. 🔥 Top Gainers (24H Volatility)")
-    print("2. 🛡️ Safe Pairs (Recommended)")
-    print("3. 🔎 Auto-Scan (Pick best from safe pairs)")
-    print("4. 🕸️ Spider Web (Top 50 async scan)")
-    cat_choice = input("Enter choice: ")
-
     data_api = SmartBackoffAPI()
     ai_engine = AI_Brain_Module()
-
-    if cat_choice == "4":
-        # STEP 13: Spider Web — scan top 50 by volume
-        print("\n🕸️ Scanning TOP 50 symbols by volume...")
-        top_symbols = await get_top_volume_symbols(50)
-        print(f"Found {len(top_symbols)} symbols. Analyzing...")
-        allocations = await rank_and_allocate(data_api, ai_engine, top_symbols, top_n=3)
-        if not allocations:
-            print("❌ No tradable symbols found.")
-            await data_api.close()
-            return
-        print("\n📊 SPIDER WEB RANKINGS:\n")
-        for i, (sym, sc, regime, weight) in enumerate(allocations, 1):
-            emoji = {"TREND": "📈", "RANGE": "📊", "CHAOS": "💀", "UNCERTAIN": "❓"}.get(regime, "❓")
-            print(f"{i}. {sym:12s} | Score: {sc:.1f}/100 | Regime: {emoji} {regime} | Allocation: {weight*100:.0f}%")
-        choice = int(input("\nSelect coin number: "))
-        symbol = allocations[choice - 1][0]
-    elif cat_choice == "3":
-        # STEP 6: Multi-coin scanner
-        print("\n🔎 Scanning safe pairs for best opportunity...")
-        safe_symbols = get_safe_pairs()
-        scores = await scan_and_pick(data_api, ai_engine, safe_symbols)
-        if not scores:
-            print("❌ No tradable symbols found.")
-            await data_api.close()
-            return
-        print("\n📊 SCAN RESULTS:\n")
-        for i, (sym, sc, regime) in enumerate(scores, 1):
-            emoji = {"TREND": "📈", "RANGE": "📊", "CHAOS": "💀", "UNCERTAIN": "❓"}.get(regime, "❓")
-            print(f"{i}. {sym:12s} | Score: {sc:.1f}/100 | Regime: {emoji} {regime}")
-        choice = int(input("\nSelect coin number: "))
-        symbol = scores[choice - 1][0]
-    elif cat_choice == "2":
-        safe_list = show_safe_pairs()
-        choice = int(input("\nSelect coin number: "))
-        symbol = safe_list[choice - 1]
-    else:
-        gainers = await show_top_gainers()
-        choice = int(input("\nSelect coin number: "))
-        symbol = gainers[choice - 1]['symbol']
-
-    print(f"\n✅ Selected: {symbol}")
-
-    print("\nSelect Leverage:")
-    print("1. 2x  (Safe)")
-    print("2. 5x  (Balanced)")
-    print("3. 10x (Standard)")
-    print("--- EXPERT TIERS ---")
-    print("4. 15x | 5. 20x | 6. 25x | 7. 30x | 8. 35x")
-    print("9. Custom (Enter any value)")
-
-    choice = input("Enter choice (or type leverage directly, e.g. 14): ").strip()
-    leverage_map = {"1": 2, "2": 5, "3": 10, "4": 15, "5": 20, "6": 25, "7": 30, "8": 35}
-    if choice in leverage_map:
-        leverage = leverage_map[choice]
-    elif choice == "9":
-        try:
-            leverage = int(input("Enter custom leverage (ex: 50): "))
-        except:
-            leverage = 2
-    else:
-        # Direct numeric input (e.g. user typed "14" for 14x)
-        try:
-            leverage = int(choice)
-            if leverage < 1 or leverage > 125:
-                print(f"⚠️ Invalid leverage {leverage}. Defaulting to 2x.")
-                leverage = 2
-        except ValueError:
-            print("⚠️ Invalid input. Defaulting to 2x.")
-            leverage = 2
-
-    print(f"✅ Leverage set to: {leverage}x")
-
-    print("\nSelect Training Mode:")
-    print("1. ⚡ Fast Start (Load existing Brain if available)")
-    print(f"2. 🧠 Force Retrain (Run Walk-Forward Grid Search on {INTERVAL} data)")
-    train_choice = input("Enter choice: ")
-    force_retrain = (train_choice == "2")
-    if force_retrain:
-        print("✅ Mode: Force Retrain")
-    else:
-        print("✅ Mode: Fast Start")
-
-    klines = await data_api.get_historical_data(symbol, INTERVAL)
-    valid, hist_df = ai_engine.train_model(klines, symbol, force_retrain=force_retrain)
     
-    if not valid or hist_df is None or len(hist_df) == 0:
-        print("❌ Model training failed / No usable data. Exiting...")
+    logging.info("🕸️ Scanning TOP 50 symbols by volume...")
+    top_symbols = await get_top_volume_symbols(50)
+    allocations = await rank_and_allocate(data_api, ai_engine, top_symbols, top_n=1)
+    
+    if not allocations:
+        logging.error("❌ No tradable symbols found. Exiting.")
         await data_api.close()
         return
-
-    while True:
-        regime = classify_regime(hist_df)
-        regime_emoji = {"TREND": "📈", "RANGE": "📊", "CHAOS": "💀", "UNCERTAIN": "❓"}.get(regime, "❓")
-        print(f"\n📊 Market Regime: {regime_emoji} {regime}")
-
-        if regime in ("CHAOS", "UNCERTAIN"):
-            print(f"❌ Regime '{regime}' — not ideal. Waiting 30 seconds to re-check...")
-            await asyncio.sleep(30)
-            
-            recent_klines = await data_api.fetch_klines(symbol, INTERVAL, limit=1000)
-            if recent_klines:
-                df_raw = pd.DataFrame(recent_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
-                                                            'ct', 'qav', 'not', 'tbb', 'tbq', 'ign'])
-                df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'], unit='ms')
-                df_raw.set_index('timestamp', inplace=True)
-                for col in ['open', 'high', 'low', 'close', 'volume']: df_raw[col] = df_raw[col].astype(float)
-                hist_df = ai_engine.feature_engineering(df_raw, rsi_length=ai_engine.best_rsi_len)
-            continue
-
-        print(f"✅ Regime '{regime}' is tradable!")
-        user = input("\nType START to trade: ").upper()
-        if user == "START":
-            live_engine = LiveTradingEngine(ai_engine, hist_df, symbol, leverage)
-            try:
-                await live_engine.run()
-            except asyncio.CancelledError:
-                pass
-            finally:
-                await live_engine.client.close()
-            break
-        else:
-            print("Exiting.")
-            break
-
+        
+    symbol = allocations[0][0]
+    logging.info(f"✅ Automatically Selected Top Symbol: {symbol}")
+    leverage = 10 
+    
+    klines = await data_api.get_historical_data(symbol, INTERVAL)
+    valid, hist_df = ai_engine.train_model(klines, symbol, force_retrain=False)
+    
+    if not valid or hist_df is None or len(hist_df) == 0:
+        logging.error("❌ Model training failed. Exiting...")
+        await data_api.close()
+        return
+        
+    logging.info("Starting Autonomous Live Trading Engine...")
+    live_engine = LiveTradingEngine(ai_engine, hist_df, symbol, leverage)
+    try:
+        await live_engine.run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await live_engine.client.close()
     await data_api.close()
 
 if __name__ == "__main__":
     try:
         import asyncio
-        asyncio.run(cli_flow())
+        asyncio.run(autonomous_startup())
     except KeyboardInterrupt:
         pass
-
