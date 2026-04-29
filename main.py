@@ -54,14 +54,22 @@ from numba import prange
 @njit(parallel=True, fastmath=True)
 def fast_features_numba(closes, highs, lows, volumes, rsi_length):
     n = len(closes)
-    out = np.zeros((n, 18), dtype=np.float64)
+    out = np.zeros((n, 24), dtype=np.float64)
     kf_x = closes[0]; kf_p = 1.0; kf_q = 1e-5; kf_r = 0.01
     ema_12 = closes[0]; ema_26 = closes[0]; macd_signal = 0.0; atr_ema = 0.0
     ema_up = 0.0; ema_down = 0.0
+    
+    # SuperTrend state
+    st_ub = 0.0; st_lb = 0.0; st_trend = 1
+    
+    # ADX state
+    dm_pos_ema = 0.0; dm_neg_ema = 0.0; adx_ema = 0.0
+    
     kalmans = np.zeros(n, dtype=np.float64)
 
     for i in range(1, n):
         c = closes[i]; pc = closes[i-1]; h = highs[i]; l = lows[i]; v = volumes[i]
+        ph = highs[i-1]; pl = lows[i-1]
         
         # Kalman Filter
         kf_p += kf_q
@@ -124,18 +132,62 @@ def fast_features_numba(closes, highs, lows, volumes, rsi_length):
         ema_down = down * alpha_rsi + ema_down * (1 - alpha_rsi)
         if ema_down == 0: rsi = 100.0
         else: rsi = 100.0 - (100.0 / (1 + (ema_up / ema_down)))
+
+        # --- SuperTrend (Multiplier=3.0, Period=10) ---
+        hl2 = (h + l) / 2
+        basic_ub = hl2 + 3.0 * atr_ema
+        basic_lb = hl2 - 3.0 * atr_ema
+        
+        if i == 1:
+            st_ub = basic_ub
+            st_lb = basic_lb
+        else:
+            if basic_ub < st_ub or closes[i-1] > st_ub: st_ub = basic_ub
+            if basic_lb > st_lb or closes[i-1] < st_lb: st_lb = basic_lb
+        
+        if st_trend == 1:
+            if c < st_lb:
+                st_trend = -1
+                st_val = st_ub
+            else:
+                st_val = st_lb
+        else:
+            if c > st_ub:
+                st_trend = 1
+                st_val = st_lb
+            else:
+                st_val = st_ub
+
+        # --- ADX (14) ---
+        ph_val = highs[i-1]
+        pl_val = lows[i-1]
+        dm_pos = max(h - ph_val, 0.0) if (h - ph_val) > (pl_val - l) else 0.0
+        dm_neg = max(pl_val - l, 0.0) if (pl_val - l) > (h - ph_val) else 0.0
+        alpha_adx = 1.0 / 14
+        dm_pos_ema = dm_pos * alpha_adx + dm_pos_ema * (1 - alpha_adx)
+        dm_neg_ema = dm_neg * alpha_adx + dm_neg_ema * (1 - alpha_adx)
+        
+        di_pos = 100.0 * dm_pos_ema / atr_ema if atr_ema != 0 else 0.0
+        di_neg = 100.0 * dm_neg_ema / atr_ema if atr_ema != 0 else 0.0
+        den = di_pos + di_neg
+        dx = 100.0 * abs(di_pos - di_neg) / den if den != 0 else 0.0
+        adx_ema = dx * alpha_adx + adx_ema * (1 - alpha_adx)
             
         out[i, 0] = kf_x; out[i, 1] = macd; out[i, 2] = macdh; out[i, 3] = macd_signal
         out[i, 4] = sma_20; out[i, 5] = sma_50; out[i, 6] = bb_u; out[i, 7] = bb_l
         out[i, 8] = atr_ema; out[i, 9] = c; out[i, 10] = ret; out[i, 11] = volatility
         out[i, 12] = momentum; out[i, 13] = trend_strength; out[i, 14] = bb_w
         out[i, 15] = kalman_slope; out[i, 16] = vol_ratio; out[i, 17] = rsi
+        out[i, 18] = st_val; out[i, 19] = st_ub; out[i, 20] = st_lb
+        out[i, 21] = adx_ema; out[i, 22] = di_pos; out[i, 23] = di_neg
         
-    state = np.array([kf_x, kf_p, ema_12, ema_26, macd_signal, atr_ema, ema_up, ema_down], dtype=np.float64)
+    state = np.array([kf_x, kf_p, ema_12, ema_26, macd_signal, atr_ema, ema_up, ema_down, 
+                      st_ub, st_lb, float(st_trend), dm_pos_ema, dm_neg_ema, adx_ema], dtype=np.float64)
     return out, state
 
 @njit(parallel=True, fastmath=True)
 def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi_length):
+    ph_val = highs[-1]; pl_val = lows[-1]
     closes[:-1] = closes[1:]; closes[-1] = c
     highs[:-1] = highs[1:]; highs[-1] = h
     lows[:-1] = lows[1:]; lows[-1] = l
@@ -144,6 +196,8 @@ def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi
     
     kf_x = state[0]; kf_p = state[1]; ema_12 = state[2]; ema_26 = state[3]
     macd_signal = state[4]; atr_ema = state[5]; ema_up = state[6]; ema_down = state[7]
+    st_ub = state[8]; st_lb = state[9]; st_trend = int(state[10])
+    dm_pos_ema = state[11]; dm_neg_ema = state[12]; adx_ema = state[13]
 
     kf_p += 1e-5
     k = kf_p / (kf_p + 0.01)
@@ -191,15 +245,50 @@ def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi
     ema_down = down * alpha_rsi + ema_down * (1 - alpha_rsi)
     rsi = 100.0 if ema_down == 0 else 100.0 - (100.0 / (1 + (ema_up / ema_down)))
 
+    # SuperTrend
+    hl2 = (h + l) / 2
+    basic_ub = hl2 + 3.0 * atr_ema
+    basic_lb = hl2 - 3.0 * atr_ema
+    if basic_ub < st_ub or pc > st_ub: st_ub = basic_ub
+    if basic_lb > st_lb or pc < st_lb: st_lb = basic_lb
+    if st_trend == 1:
+        if c < st_lb:
+            st_trend = -1
+            st_val = st_ub
+        else:
+            st_val = st_lb
+    else:
+        if c > st_ub:
+            st_trend = 1
+            st_val = st_lb
+        else:
+            st_val = st_ub
+
+    # ADX
+    dm_pos = max(h - ph_val, 0.0) if (h - ph_val) > (pl_val - l) else 0.0
+    dm_neg = max(pl_val - l, 0.0) if (pl_val - l) > (h - ph_val) else 0.0
+    alpha_adx = 1.0 / 14
+    dm_pos_ema = dm_pos * alpha_adx + dm_pos_ema * (1 - alpha_adx)
+    dm_neg_ema = dm_neg * alpha_adx + dm_neg_ema * (1 - alpha_adx)
+    di_pos = 100.0 * dm_pos_ema / atr_ema if atr_ema != 0 else 0.0
+    di_neg = 100.0 * dm_neg_ema / atr_ema if atr_ema != 0 else 0.0
+    den = di_pos + di_neg
+    dx = 100.0 * abs(di_pos - di_neg) / den if den != 0 else 0.0
+    adx_ema = dx * alpha_adx + adx_ema * (1 - alpha_adx)
+
     state[0] = kf_x; state[1] = kf_p; state[2] = ema_12; state[3] = ema_26
     state[4] = macd_signal; state[5] = atr_ema; state[6] = ema_up; state[7] = ema_down
+    state[8] = st_ub; state[9] = st_lb; state[10] = float(st_trend)
+    state[11] = dm_pos_ema; state[12] = dm_neg_ema; state[13] = adx_ema
     
-    out = np.empty(18, dtype=np.float64)
+    out = np.empty(24, dtype=np.float64)
     out[0] = kf_x; out[1] = macd; out[2] = macdh; out[3] = macd_signal
     out[4] = sma_20; out[5] = sma_50; out[6] = bb_u; out[7] = bb_l
     out[8] = atr_ema; out[9] = c; out[10] = ret; out[11] = volatility
     out[12] = momentum; out[13] = trend_strength; out[14] = bb_w
     out[15] = kalman_slope; out[16] = vol_ratio; out[17] = rsi
+    out[18] = st_val; out[19] = st_ub; out[20] = st_lb
+    out[21] = adx_ema; out[22] = di_pos; out[23] = di_neg
     return out
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -221,6 +310,11 @@ TRADE_COOLDOWN_SECONDS = 90      # Increased cooldown to prevent overtrading
 ATR_SL_MULTIPLIER = 1.2          # SL = entry ± (ATR × 1.2)
 ATR_TP_MULTIPLIER = 2.5          # TP = entry ± (ATR × 2.5)
 TIME_EXIT_SECONDS = 180           # Close stale trades after 3 minutes
+
+# 🔧 Advanced Indicator Params
+SUPERTREND_PERIOD = 10
+SUPERTREND_MULT = 3.0
+ADX_PERIOD = 14
 
 # PRO EXIT PARAMETERS
 TRAIL_ACTIVATION_ATR = 1.0       # Activate trailing after 1× ATR profit
@@ -392,32 +486,31 @@ async def micro_signal(client):
 # =========================================================
 # STEP 3: SIGNAL FUSION (Ensemble Voting)
 # =========================================================
-def combine_signals(regime, trend, rev, micro, htf_bias=0.0):
+def combine_signals(regime, trend, rev, micro, st_signal, adx, htf_bias=0.0):
     """Weighted ensemble voting — routes to correct engines based on regime
     
-    htf_bias: Soft directional influence from Higher Timeframe analysis.
-              Positive = bullish HTF, Negative = bearish HTF.
+    Incorporates SuperTrend and ADX strength into the voting process.
     """
     signals = []
 
     if regime == "TREND":
-        signals.append(trend)
+        # Weight trend signal more if ADX is high
+        adx_boost = 1.0 + (adx / 100.0)
+        signals.append((trend[0], trend[1] * adx_boost))
         signals.append(micro)
+        if st_signal != 0:
+            signals.append((st_signal, 0.4)) # Soft SuperTrend confirmation
 
     elif regime == "RANGE":
         signals.append(rev)
         signals.append(micro)
-        signals.append(trend)  # Give trend a voice in RANGE too
+        signals.append(trend)
 
     else:
-        return 0, 0  # CHAOS or UNCERTAIN — no trade
+        return 0, 0
 
-    # weighted voting: signal × confidence
     score = sum([s[0] * s[1] for s in signals])
-
-    # 🔧 HTF Bias: Soft influence from higher timeframe trend
     score += htf_bias
-
     confidence = sum([s[1] for s in signals]) / len(signals)
 
     if score > 0:
@@ -909,15 +1002,13 @@ class SmartBackoffAPI:
 # =========================================================
 
 @njit
-def _triple_barrier_numba(closes, atrs, atr_multiplier, time_limit):
-    """Numba-compiled triple-barrier labeling loop — sub-millisecond on 87k rows."""
+def _triple_barrier_numba(closes, tps, sls, time_limit):
+    """Numba-compiled triple-barrier labeling loop with dynamic targets."""
     n = len(closes)
     labels = np.zeros(n, dtype=np.int64)
     for i in range(n):
-        entry = closes[i]
-        atr = atrs[i]
-        tp = entry + atr * atr_multiplier
-        sl = entry - atr * atr_multiplier
+        tp = tps[i]
+        sl = sls[i]
         end = min(i + time_limit, n)
         for j in range(i + 1, end):
             price = closes[j]
@@ -937,7 +1028,9 @@ class AI_Brain_Module:
             'kalman', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
             'sma_20', 'sma_50', 'bb_upper', 'bb_lower', 'atr_14', 'close',
             'returns', 'volatility', 'momentum', 'trend_strength',
-            'bb_width', 'kalman_slope', 'volume_ratio',
+            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi',
+            'supertrend', 'adx', 'di_plus', 'di_minus',
+            'hour', 'day_of_week',
             'obi', 'cvd', 'oi_change',
             'htf_trend', 'htf_strength'
         ]
@@ -954,7 +1047,9 @@ class AI_Brain_Module:
             'kalman', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
             'sma_20', 'sma_50', 'bb_upper', 'bb_lower', 'atr_14', 'close',
             'returns', 'volatility', 'momentum', 'trend_strength',
-            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi'
+            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi',
+            'supertrend', 'supertrend_ub', 'supertrend_lb',
+            'adx', 'di_plus', 'di_minus'
         ]
 
         import pandas as pd
@@ -977,14 +1072,27 @@ class AI_Brain_Module:
         htf_sma_50 = close_series.rolling(window=100, min_periods=1).mean()
         out_df['htf_trend'] = (htf_sma_20 > htf_sma_50).astype(float)
         out_df['htf_strength'] = (htf_sma_20 - htf_sma_50) / close_series.replace(0, np.nan).fillna(1.0)
+        
+        # session-based features
+        out_df['hour'] = out_df.index.hour
+        out_df['day_of_week'] = out_df.index.dayofweek
 
         return out_df.iloc[50:].copy() if len(out_df) > 50 else out_df.copy()
 
-    def label_data(self, df, atr_multiplier=1.5, time_limit=10):
-        """STEP 10: Triple-Barrier Labeling — Numba-accelerated when available."""
+    def label_data(self, df, time_limit=10):
+        """STEP 10: Triple-Barrier Labeling — Dynamic ATR targets per row."""
         closes = df['close'].values.astype(np.float64)
         atrs = df['atr_14'].values.astype(np.float64)
-        labels = _triple_barrier_numba(closes, atrs, atr_multiplier, time_limit)
+        volatilities = atrs / (closes + 1e-9)
+        
+        # 🔧 Dynamic ATR multiplier: more volatility -> slightly wider targets to reduce noise
+        # Scale multiplier between 1.2 and 2.5 based on volatility
+        dynamic_mults = 1.2 + np.clip((volatilities - 0.004) * 150.0, 0.0, 1.3)
+        
+        tps = closes + atrs * dynamic_mults
+        sls = closes - atrs * dynamic_mults
+        
+        labels = _triple_barrier_numba(closes, tps, sls, time_limit)
         df['target'] = labels
         # Map to binary for LightGBM classifier: 1 = profitable, 0 = not
         df['target'] = df['target'].map({1: 1, 0: 0, -1: 0})
@@ -1017,9 +1125,10 @@ class AI_Brain_Module:
             X_test, y_test = X.iloc[train_end:test_end], y.iloc[train_end:test_end]
 
             model = LGBMClassifier(
-                n_estimators=300, max_depth=8, learning_rate=0.05,
+                n_estimators=500, max_depth=10, learning_rate=0.03,
                 subsample=0.8, colsample_bytree=0.8,
-                min_child_samples=50, reg_alpha=0.1, reg_lambda=0.1,
+                min_child_samples=30, reg_alpha=0.5, reg_lambda=0.5,
+                extra_trees=True, path_smooth=1.0,
                 random_state=42, verbose=-1, n_jobs=-1
             )
             model.fit(X_train, y_train)
@@ -1738,9 +1847,21 @@ class LiveTradingEngine:
 
         qty = await self.compute_wallet_qty(c_price, atr_value, confidence, regime)
         qty_str = fmt_qty(qty, self.step_size)
-        # Safeguard Stops: Ensure SL/TP are strictly relative to entry (c_price)
-        base_sl_dist = atr_value * 2.0
-        base_tp_dist = atr_value * 4.0
+        
+        # 🔧 Dynamic ATR-based Targets: Scale targets based on market regime and confidence
+        sl_mult = ATR_SL_MULTIPLIER
+        tp_mult = ATR_TP_MULTIPLIER
+        
+        if regime == "TREND":
+            tp_mult *= 1.2 # Let trends run
+        elif regime == "RANGE":
+            tp_mult *= 0.8 # Tighter targets in range
+            
+        if confidence and confidence > 0.90:
+            tp_mult *= 1.1 # More confidence, slightly more target
+        
+        base_sl_dist = atr_value * sl_mult
+        base_tp_dist = atr_value * tp_mult
         
         max_dist = c_price * 0.10
         if base_sl_dist > max_dist or base_sl_dist <= 0:
@@ -1830,9 +1951,14 @@ class LiveTradingEngine:
         latest_feat_dict['cvd'] = live_cvd
         latest_feat_dict['oi_change'] = live_oi_change
 
+        # 🔧 SuperTrend & ADX extraction
+        st_val = latest_feat_dict.get('supertrend', c_price)
+        st_signal = 1 if c_price > st_val else -1
+        adx = latest_feat_dict.get('adx', 0.0)
+
         # 🔧 HTF Bias: Soft directional influence from higher timeframe
         htf_bias = 0.2 if latest_feat_dict.get('htf_trend', 0.5) > 0.5 else -0.2
-        signal, base_conf = combine_signals(regime, t_sig, r_sig, m_sig, htf_bias=htf_bias)
+        signal, base_conf = combine_signals(regime, t_sig, r_sig, m_sig, st_signal, adx, htf_bias=htf_bias)
 
         # 🔧 Momentum Override: Detect fast dumps/pumps and force directional bias
         returns = latest_feat_dict.get('returns', 0.0)
@@ -1924,8 +2050,14 @@ class LiveTradingEngine:
             'sma_20': feat_vals[4], 'sma_50': feat_vals[5], 'bb_upper': feat_vals[6], 'bb_lower': feat_vals[7],
             'atr_14': feat_vals[8], 'close': feat_vals[9], 'returns': feat_vals[10], 'volatility': feat_vals[11],
             'momentum': feat_vals[12], 'trend_strength': feat_vals[13], 'bb_width': feat_vals[14], 'kalman_slope': feat_vals[15],
-            'volume_ratio': feat_vals[16], 'rsi': feat_vals[17]
+            'volume_ratio': feat_vals[16], 'rsi': feat_vals[17],
+            'supertrend': feat_vals[18], 'adx': feat_vals[21], 'di_plus': feat_vals[22], 'di_minus': feat_vals[23]
         }
+        # session-based features
+        import datetime
+        now_dt = datetime.datetime.now()
+        latest_feat_dict['hour'] = now_dt.hour
+        latest_feat_dict['day_of_week'] = now_dt.weekday()
         
         # 🔧 HTF Features: Compute from rolling buffer (wider-window SMAs)
         # SMA(40) ≈ HTF SMA(20) at 2× timeframe, SMA(100) ≈ HTF SMA(50)
