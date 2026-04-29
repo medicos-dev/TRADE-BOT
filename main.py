@@ -54,11 +54,19 @@ from numba import prange
 @njit(parallel=True, fastmath=True)
 def fast_features_numba(closes, highs, lows, volumes, rsi_length):
     n = len(closes)
-    out = np.zeros((n, 18), dtype=np.float64)
+    out = np.zeros((n, 26), dtype=np.float64)
     kf_x = closes[0]; kf_p = 1.0; kf_q = 1e-5; kf_r = 0.01
     ema_12 = closes[0]; ema_26 = closes[0]; macd_signal = 0.0; atr_ema = 0.0
     ema_up = 0.0; ema_down = 0.0
     kalmans = np.zeros(n, dtype=np.float64)
+    
+    # SuperTrend state
+    st_atr = closes[0]; st_up = closes[0]; st_down = closes[0]; st_trend = 0.0
+    
+    # ADX state (Wilder smoothing)
+    adx_period = 14
+    plus_dm_ema = 0.0; minus_dm_ema = 0.0; atr14_ema = 0.0
+    dx_ema = 0.0; adx_val = 0.0
 
     for i in range(1, n):
         c = closes[i]; pc = closes[i-1]; h = highs[i]; l = lows[i]; v = volumes[i]
@@ -96,6 +104,53 @@ def fast_features_numba(closes, highs, lows, volumes, rsi_length):
         alpha_rsi = 1.0 / rsi_length
         atr_ema = tr * alpha_rsi + atr_ema * (1 - alpha_rsi)
         
+        # SuperTrend calculation (ATR-10 based, 3x multiplier)
+        if i >= 10:
+            tr_st = max(h - l, max(abs(h - pc), abs(l - pc)))
+            st_atr = st_atr * (9/11) + tr_st * (2/11)
+            hl2 = (h + l) / 2.0
+            new_up = hl2 + 3.0 * st_atr
+            new_down = hl2 - 3.0 * st_atr
+            
+            if c > st_up:
+                st_trend = 1.0
+            elif c < st_down:
+                st_trend = -1.0
+            st_up = new_up
+            st_down = new_down
+        else:
+            st_up = c; st_down = c; st_trend = 0.0
+        
+        # ADX calculation (Wilder smoothing)
+        high_diff = h - highs[i-1] if i >= 1 else 0.0
+        low_diff = lows[i-1] - l if i >= 1 else 0.0
+        
+        plus_dm = high_diff if high_diff > low_diff and high_diff > 0 else 0.0
+        minus_dm = low_diff if low_diff > high_diff and low_diff > 0 else 0.0
+        
+        if i == 1:
+            plus_dm_ema = plus_dm
+            minus_dm_ema = minus_dm
+            atr14_ema = tr
+        else:
+            plus_dm_ema = (plus_dm_ema * (adx_period - 1) + plus_dm) / adx_period
+            minus_dm_ema = (minus_dm_ema * (adx_period - 1) + minus_dm) / adx_period
+            atr14_ema = (atr14_ema * (adx_period - 1) + tr) / adx_period
+        
+        di_denom = atr14_ema if atr14_ema > 0 else 1.0
+        di_plus = (plus_dm_ema / di_denom) * 100.0
+        di_minus = (minus_dm_ema / di_denom) * 100.0
+        
+        di_sum = di_plus + di_minus if (di_plus + di_minus) > 0 else 1.0
+        dx = abs(di_plus - di_minus) / di_sum * 100.0
+        
+        if i == 1:
+            dx_ema = dx
+            adx_val = dx
+        else:
+            dx_ema = (dx_ema * (adx_period - 1) + dx) / adx_period
+            adx_val = dx_ema
+        
         # Returns & Volatility
         ret = (c - pc) / pc if pc != 0 else 0.0
         if i >= 9:
@@ -130,8 +185,13 @@ def fast_features_numba(closes, highs, lows, volumes, rsi_length):
         out[i, 8] = atr_ema; out[i, 9] = c; out[i, 10] = ret; out[i, 11] = volatility
         out[i, 12] = momentum; out[i, 13] = trend_strength; out[i, 14] = bb_w
         out[i, 15] = kalman_slope; out[i, 16] = vol_ratio; out[i, 17] = rsi
+        out[i, 18] = st_trend; out[i, 19] = st_up; out[i, 20] = st_down
+        out[i, 21] = adx_val; out[i, 22] = di_plus; out[i, 23] = di_minus
+        out[i, 24] = 0.0; out[i, 25] = 0.0  # Placeholder for session features
         
-    state = np.array([kf_x, kf_p, ema_12, ema_26, macd_signal, atr_ema, ema_up, ema_down], dtype=np.float64)
+    state = np.array([kf_x, kf_p, ema_12, ema_26, macd_signal, atr_ema, ema_up, ema_down,
+                      st_atr, st_up, st_down, st_trend,
+                      plus_dm_ema, minus_dm_ema, atr14_ema, di_plus, di_minus, adx_val, dx_ema], dtype=np.float64)
     return out, state
 
 @njit(parallel=True, fastmath=True)
@@ -141,9 +201,13 @@ def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi
     lows[:-1] = lows[1:]; lows[-1] = l
     vols[:-1] = vols[1:]; vols[-1] = v
     pc = closes[-2]
+    ph = highs[-2]; pl = lows[-2]
     
     kf_x = state[0]; kf_p = state[1]; ema_12 = state[2]; ema_26 = state[3]
     macd_signal = state[4]; atr_ema = state[5]; ema_up = state[6]; ema_down = state[7]
+    st_atr = state[8]; st_up = state[9]; st_down = state[10]; st_trend = state[11]
+    plus_dm_ema = state[12]; minus_dm_ema = state[13]; atr14_ema = state[14]
+    di_plus = state[15]; di_minus = state[16]; adx_val = state[17]; dx_ema = state[18]
 
     kf_p += 1e-5
     k = kf_p / (kf_p + 0.01)
@@ -170,6 +234,37 @@ def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi
     alpha_rsi = 1.0 / rsi_length
     atr_ema = tr * alpha_rsi + atr_ema * (1 - alpha_rsi)
     
+    # SuperTrend update
+    tr_st = max(h - l, max(abs(h - pc), abs(l - pc)))
+    st_atr = st_atr * (9/11) + tr_st * (2/11)
+    hl2 = (h + l) / 2.0
+    new_up = hl2 + 3.0 * st_atr
+    new_down = hl2 - 3.0 * st_atr
+    
+    if c > st_up:
+        st_trend = 1.0
+    elif c < st_down:
+        st_trend = -1.0
+    st_up = new_up
+    st_down = new_down
+    
+    # ADX update
+    adx_period = 14
+    high_diff = h - ph
+    low_diff = pl - l
+    plus_dm = high_diff if high_diff > low_diff and high_diff > 0 else 0.0
+    minus_dm = low_diff if low_diff > high_diff and low_diff > 0 else 0.0
+    plus_dm_ema = (plus_dm_ema * (adx_period - 1) + plus_dm) / adx_period
+    minus_dm_ema = (minus_dm_ema * (adx_period - 1) + minus_dm) / adx_period
+    atr14_ema = (atr14_ema * (adx_period - 1) + tr) / adx_period
+    di_denom = atr14_ema if atr14_ema > 0 else 1.0
+    di_plus = (plus_dm_ema / di_denom) * 100.0
+    di_minus = (minus_dm_ema / di_denom) * 100.0
+    di_sum = di_plus + di_minus if (di_plus + di_minus) > 0 else 1.0
+    dx = abs(di_plus - di_minus) / di_sum * 100.0
+    dx_ema = (dx_ema * (adx_period - 1) + dx) / adx_period
+    adx_val = dx_ema
+    
     ret = (c - pc) / pc if pc != 0 else 0.0
     rets = np.zeros(10)
     for j in range(10):
@@ -193,13 +288,19 @@ def numba_tick_update(c, h, l, v, closes, highs, lows, vols, kalmans, state, rsi
 
     state[0] = kf_x; state[1] = kf_p; state[2] = ema_12; state[3] = ema_26
     state[4] = macd_signal; state[5] = atr_ema; state[6] = ema_up; state[7] = ema_down
+    state[8] = st_atr; state[9] = st_up; state[10] = st_down; state[11] = st_trend
+    state[12] = plus_dm_ema; state[13] = minus_dm_ema; state[14] = atr14_ema
+    state[15] = di_plus; state[16] = di_minus; state[17] = adx_val; state[18] = dx_ema
     
-    out = np.empty(18, dtype=np.float64)
+    out = np.empty(26, dtype=np.float64)
     out[0] = kf_x; out[1] = macd; out[2] = macdh; out[3] = macd_signal
     out[4] = sma_20; out[5] = sma_50; out[6] = bb_u; out[7] = bb_l
     out[8] = atr_ema; out[9] = c; out[10] = ret; out[11] = volatility
     out[12] = momentum; out[13] = trend_strength; out[14] = bb_w
     out[15] = kalman_slope; out[16] = vol_ratio; out[17] = rsi
+    out[18] = st_trend; out[19] = st_up; out[20] = st_down
+    out[21] = adx_val; out[22] = di_plus; out[23] = di_minus
+    out[24] = 0.0; out[25] = 0.0  # Placeholder for session features
     return out
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -285,6 +386,54 @@ def get_dynamic_threshold(atr, price):
         return 0.60  # Medium vol
     else:
         return 0.65  # Low vol — still tightest filter
+
+def get_dynamic_atr_multipliers(atr, price, regime, adx):
+    """Dynamic ATR-based SL/TP multipliers that adapt to market conditions.
+    
+    Returns (sl_mult, tp_mult) tuples.
+    
+    - Low ADX (weak trend): tighter targets
+    - High ADX (strong trend): wider targets
+    - Regime-based adjustments
+    """
+    volatility = atr / price
+    
+    # Base multipliers
+    base_sl = 1.2
+    base_tp = 2.5
+    
+    # ADX-based adjustments (stronger trend = wider targets for better R:R)
+    if adx > 30:  # Strong trend
+        base_sl = 1.0  # Tighter stop
+        base_tp = 3.0  # Wider take profit
+    elif adx > 20:  # Moderate trend
+        base_sl = 1.1
+        base_tp = 2.75
+    # else: use defaults
+    
+    # Regime-based adjustments
+    if regime == "TREND":
+        # In strong trends, give more room
+        base_sl *= 0.9
+        base_tp *= 1.1
+    elif regime == "RANGE":
+        # In range, use tighter targets
+        base_sl *= 1.2
+        base_tp *= 0.8
+    elif regime == "CHAOS":
+        # In chaos, use minimum exposure
+        base_sl *= 1.5
+        base_tp *= 0.6
+    
+    # Volatility scaling
+    if volatility > 0.008:
+        base_sl *= 1.3  # More room in volatile markets
+        base_tp *= 1.2
+    elif volatility < 0.002:
+        base_sl *= 0.8  # Tighter stops in calm markets
+        base_tp *= 0.9
+    
+    return base_sl, base_tp
 
 async def get_top_gainers(limit=20):
     url = f"{REST_BASE}/fapi/v1/ticker/24hr"
@@ -392,23 +541,44 @@ async def micro_signal(client):
 # =========================================================
 # STEP 3: SIGNAL FUSION (Ensemble Voting)
 # =========================================================
-def combine_signals(regime, trend, rev, micro, htf_bias=0.0):
+def combine_signals(regime, trend, rev, micro, htf_bias=0.0, supertrend=0.0, adx=0.0):
     """Weighted ensemble voting — routes to correct engines based on regime
     
     htf_bias: Soft directional influence from Higher Timeframe analysis.
               Positive = bullish HTF, Negative = bearish HTF.
+    supertrend: SuperTrend indicator (1=bullish, -1=bearish, 0=neutral)
+    adx: Average Directional Index (0-100, higher = stronger trend)
     """
     signals = []
 
-    if regime == "TREND":
-        signals.append(trend)
-        signals.append(micro)
+    # SuperTrend alignment bonus (stronger signal when SuperTrend agrees)
+    st_bonus = 0.0
+    if supertrend != 0.0 and adx > 20:
+        st_bonus = 0.15  # Add 15% confidence boost when ADX confirms trend
+        
+        if regime == "TREND":
+            signals.append(trend)
+            signals.append(micro)
+        elif regime == "RANGE":
+            signals.append(rev)
+            signals.append(micro)
+            signals.append(trend)
+        else:
+            return 0, 0  # CHAOS or UNCERTAIN — no trade
 
-    elif regime == "RANGE":
-        signals.append(rev)
-        signals.append(micro)
-        signals.append(trend)  # Give trend a voice in RANGE too
-
+        # Apply SuperTrend bias
+        for sig_tuple in signals:
+            # Check if signal agrees with SuperTrend
+            if supertrend == sig_tuple[0]:
+                sig_tuple = (sig_tuple[0], sig_tuple[1] + st_bonus)
+    elif regime == "TREND" or regime == "RANGE":
+        if regime == "TREND":
+            signals.append(trend)
+            signals.append(micro)
+        elif regime == "RANGE":
+            signals.append(rev)
+            signals.append(micro)
+            signals.append(trend)
     else:
         return 0, 0  # CHAOS or UNCERTAIN — no trade
 
@@ -418,7 +588,14 @@ def combine_signals(regime, trend, rev, micro, htf_bias=0.0):
     # 🔧 HTF Bias: Soft influence from higher timeframe trend
     score += htf_bias
 
-    confidence = sum([s[1] for s in signals]) / len(signals)
+    confidence = sum([s[1] for s in signals]) / len(signals) if signals else 0.0
+
+    # ADX trend strength filter
+    if adx < 15 and len(signals) == 0:
+        # Very weak trend - use SuperTrend only if present
+        if supertrend != 0.0:
+            return int(supertrend), 0.55
+        return 0, 0
 
     if score > 0:
         return 1, confidence
@@ -939,7 +1116,10 @@ class AI_Brain_Module:
             'returns', 'volatility', 'momentum', 'trend_strength',
             'bb_width', 'kalman_slope', 'volume_ratio',
             'obi', 'cvd', 'oi_change',
-            'htf_trend', 'htf_strength'
+            'htf_trend', 'htf_strength',
+            'supertrend', 'supertrend_upper', 'supertrend_lower',
+            'adx', 'di_plus', 'di_minus',
+            'hour_of_day', 'day_of_week'
         ]
 
     def feature_engineering(self, df, rsi_length=14):
@@ -954,7 +1134,9 @@ class AI_Brain_Module:
             'kalman', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9',
             'sma_20', 'sma_50', 'bb_upper', 'bb_lower', 'atr_14', 'close',
             'returns', 'volatility', 'momentum', 'trend_strength',
-            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi'
+            'bb_width', 'kalman_slope', 'volume_ratio', 'rsi',
+            'supertrend', 'supertrend_upper', 'supertrend_lower',
+            'adx', 'di_plus', 'di_minus', 'hour_of_day', 'day_of_week'
         ]
 
         import pandas as pd
@@ -971,12 +1153,19 @@ class AI_Brain_Module:
         out_df['oi_change'] = df['oi_change'].iloc[-len(feats):].values if 'oi_change' in df.columns else 0.0
 
         # 🔧 HTF (Higher Timeframe) features via wider-window SMAs
-        # SMA(40) ≈ HTF SMA(20) at 2× timeframe, SMA(100) ≈ HTF SMA(50)
         close_series = out_df['close']
         htf_sma_20 = close_series.rolling(window=40, min_periods=1).mean()
         htf_sma_50 = close_series.rolling(window=100, min_periods=1).mean()
         out_df['htf_trend'] = (htf_sma_20 > htf_sma_50).astype(float)
         out_df['htf_strength'] = (htf_sma_20 - htf_sma_50) / close_series.replace(0, np.nan).fillna(1.0)
+
+        # Session-based features (cyclical market patterns)
+        if df.index.tz is not None:
+            local_idx = df.index.tz_localize(None)
+        else:
+            local_idx = df.index
+        out_df['hour_of_day'] = local_idx.hour + local_idx.minute / 60.0
+        out_df['day_of_week'] = local_idx.dayofweek
 
         return out_df.iloc[50:].copy() if len(out_df) > 50 else out_df.copy()
 
@@ -1017,10 +1206,12 @@ class AI_Brain_Module:
             X_test, y_test = X.iloc[train_end:test_end], y.iloc[train_end:test_end]
 
             model = LGBMClassifier(
-                n_estimators=300, max_depth=8, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
-                min_child_samples=50, reg_alpha=0.1, reg_lambda=0.1,
-                random_state=42, verbose=-1, n_jobs=-1
+                n_estimators=500, max_depth=6, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.7,
+                min_child_samples=30, reg_alpha=0.5, reg_lambda=0.5,
+                extra_trees=True, path_smooth=0.1,
+                random_state=42, verbose=-1, n_jobs=-1,
+                importance_type='gain'
             )
             model.fit(X_train, y_train)
 
@@ -1924,8 +2115,17 @@ class LiveTradingEngine:
             'sma_20': feat_vals[4], 'sma_50': feat_vals[5], 'bb_upper': feat_vals[6], 'bb_lower': feat_vals[7],
             'atr_14': feat_vals[8], 'close': feat_vals[9], 'returns': feat_vals[10], 'volatility': feat_vals[11],
             'momentum': feat_vals[12], 'trend_strength': feat_vals[13], 'bb_width': feat_vals[14], 'kalman_slope': feat_vals[15],
-            'volume_ratio': feat_vals[16], 'rsi': feat_vals[17]
+            'volume_ratio': feat_vals[16], 'rsi': feat_vals[17],
+            'supertrend': feat_vals[18], 'supertrend_upper': feat_vals[19], 'supertrend_lower': feat_vals[20],
+            'adx': feat_vals[21], 'di_plus': feat_vals[22], 'di_minus': feat_vals[23],
+            'hour_of_day': feat_vals[24], 'day_of_week': feat_vals[25]
         }
+        
+        # Session features from current time
+        import datetime
+        now_dt = datetime.datetime.now()
+        latest_feat_dict['hour_of_day'] = now_dt.hour + now_dt.minute / 60.0
+        latest_feat_dict['day_of_week'] = now_dt.weekday()
         
         # 🔧 HTF Features: Compute from rolling buffer (wider-window SMAs)
         # SMA(40) ≈ HTF SMA(20) at 2× timeframe, SMA(100) ≈ HTF SMA(50)
